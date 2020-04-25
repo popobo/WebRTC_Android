@@ -4,6 +4,7 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 
 import android.app.Activity;
+import android.content.PeriodicSync;
 import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.util.Log;
@@ -30,14 +31,23 @@ import org.webrtc.VideoSource;
 import org.webrtc.VideoTrack;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 
 public class MainActivity extends AppCompatActivity implements SignalingClient.Callback {
+    EglBase.Context eglBaseContext;
     PeerConnectionFactory peerConnectionFactory;
-    PeerConnection peerConnection;
     SurfaceViewRenderer localView;
-    SurfaceViewRenderer remoteView;
     MediaStream mediaStream;
+    //存储ICE服务器
+    List<PeerConnection.IceServer> iceServers;
+
+    //peerConnectionHashMap存储其他客户端的socketId和对应的PeerConnection
+    HashMap<String, PeerConnection> peerConnectionHashMap;
+    //视频数据在 native 层处理完毕后会抛出到 VideoRenderer.Callbacks#renderFrame 回调中，在这里也就是 SurfaceViewRenderer#renderFrame，而 SurfaceViewRenderer 又会把数据交给 EglRenderer 进行渲染
+    //remoteViews 三个远端客户端画面的渲染
+    SurfaceViewRenderer[] remoteViews;
+    int remoteViewsIndex = 0;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -46,8 +56,13 @@ public class MainActivity extends AppCompatActivity implements SignalingClient.C
         verifyStoragePermissions(this);
         // create PeerConnectionFactory
 
+        // 此处初始化类成员
+        peerConnectionHashMap = new HashMap<>();
+        iceServers = new ArrayList<>();
+        iceServers.add(PeerConnection.IceServer.builder("turn:bocode.xyz:3478").setUsername("bo_turn").setPassword("123654").createIceServer());
+
         //创建EglBase对象, WebRTC 把 EGL 的操作封装在了 EglBase 中，并针对 EGL10 和 EGL14 提供了不同的实现
-        EglBase.Context eglBaseContext = EglBase.create().getEglBaseContext();
+        eglBaseContext = EglBase.create().getEglBaseContext();
 
         // create PeerConnectionFactory
         // PeerConnectionFactory负责创建PeerConnection、VideoTrack、AudioTrack等重要对象
@@ -67,12 +82,13 @@ public class MainActivity extends AppCompatActivity implements SignalingClient.C
                 setVideoDecoderFactory(defaultVideoDecoderFactory).
                 createPeerConnectionFactory();
 
-        SurfaceTextureHelper localSurfaceTextureHelper = SurfaceTextureHelper.create("localCaptureThread", eglBaseContext);
+        // SurfaceTextureHelper 负责创建 SurfaceTexture，接收 SurfaceTexture 数据，相机线程的管理
+        SurfaceTextureHelper surfaceTextureHelper = SurfaceTextureHelper.create("CaptureThread", eglBaseContext);
         // create VideoCapturer
         // 获取前置摄像头
         VideoCapturer videoCapturer = createCameraCapturer(true);
         VideoSource videoSource = peerConnectionFactory.createVideoSource(videoCapturer.isScreencast());
-        videoCapturer.initialize(localSurfaceTextureHelper, getApplicationContext(), videoSource.getCapturerObserver());
+        videoCapturer.initialize(surfaceTextureHelper, getApplicationContext(), videoSource.getCapturerObserver());
         videoCapturer.startCapture(480, 640, 30);
 
         localView = findViewById(R.id.localView);
@@ -84,20 +100,54 @@ public class MainActivity extends AppCompatActivity implements SignalingClient.C
 //        // display in localView
         videoTrack.addSink(localView);
 
-        remoteView = findViewById(R.id.remoteView);
-        remoteView.setMirror(true);
-        remoteView.init(eglBaseContext, null);
+        // SurfaceViewRenderer 数组
+        remoteViews = new SurfaceViewRenderer[]{
+                findViewById(R.id.remoteView),
+                findViewById(R.id.remoteView2),
+                findViewById(R.id.remoteView3)
+        };
 
-        AudioSource audioSource = peerConnectionFactory.createAudioSource(new MediaConstraints());
-        AudioTrack audioTrack = peerConnectionFactory.createAudioTrack("101", audioSource);
+        for (SurfaceViewRenderer remoteView : remoteViews){
+            remoteView.setMirror(false);
+            remoteView.init(eglBaseContext, null);
+        }
+
+//        AudioSource audioSource = peerConnectionFactory.createAudioSource(new MediaConstraints());
+//        AudioTrack audioTrack = peerConnectionFactory.createAudioTrack("101", audioSource);
 
         mediaStream = peerConnectionFactory.createLocalMediaStream("mediaStream");
         mediaStream.addTrack(videoTrack);
-        mediaStream.addTrack(audioTrack);
+//        mediaStream.addTrack(audioTrack);
 
-        SignalingClient.get().setCallback(this);
+        SignalingClient.get().init(this);
+    }
 
-        call();
+    // 获取或创建其他客户端的peerConnection
+    private synchronized PeerConnection getOrCreatePeerConnection(String socketId){
+        PeerConnection peerConnection = peerConnectionHashMap.get(socketId);
+        if (peerConnection != null){
+            return peerConnection;
+        }
+        peerConnection = peerConnectionFactory.createPeerConnection(iceServers, new PeerConnectionAdapter("PC" + socketId){
+            @Override
+            // RTCPeerConnection 的属性 onIceCandidate （是一个事件触发器 EventHandler） 能够让函数在事件icecandidate发生在实例  RTCPeerConnection 上时被调用。 只要本地代理ICE 需要通过信令服务器传递信息给其他对等端时就会触发。
+            public void onIceCandidate(IceCandidate iceCandidate) {
+                super.onIceCandidate(iceCandidate);
+                SignalingClient.get().sendIceCandidate(iceCandidate, socketId);
+            }
+
+            @Override
+            public void onAddStream(MediaStream mediaStream) {
+                super.onAddStream(mediaStream);
+                VideoTrack remoteVideoTrack = mediaStream.videoTracks.get(0);
+                runOnUiThread(()->{
+                    remoteVideoTrack.addSink(remoteViews[remoteViewsIndex++]);
+                });
+            }
+        });
+        peerConnection.addStream(mediaStream);
+        peerConnectionHashMap.put(socketId, peerConnection);
+        return peerConnection;
     }
 
     // isFront==true 获取前置摄像头, 反之获取后置摄像头
@@ -117,28 +167,6 @@ public class MainActivity extends AppCompatActivity implements SignalingClient.C
         }
 
         return null;
-    }
-
-    private void call(){
-        List<PeerConnection.IceServer> iceServers = new ArrayList<>();
-        iceServers.add(PeerConnection.IceServer.builder("turn:bocode.xyz:3478").setUsername("bo_turn").setPassword("123654").createIceServer());
-        peerConnection = peerConnectionFactory.createPeerConnection(iceServers, new PeerConnectionAdapter("localConnection"){
-            @Override
-            public void onIceCandidate(IceCandidate iceCandidate) {
-                super.onIceCandidate(iceCandidate);
-                SignalingClient.get().sendIceCandidate(iceCandidate);
-            }
-
-            @Override
-            public void onAddStream(MediaStream mediaStream) {
-                super.onAddStream(mediaStream);
-                VideoTrack remoteVideoTrack = mediaStream.videoTracks.get(0);
-                runOnUiThread(()-> remoteVideoTrack.addSink(remoteView));
-            }
-        });
-
-        assert peerConnection != null;
-        peerConnection.addStream(mediaStream);
     }
 
     private static final int REQUEST_ALL = 1;
@@ -177,20 +205,29 @@ public class MainActivity extends AppCompatActivity implements SignalingClient.C
     }
 
     @Override
-    public void onPeerJoined(String socketId) {
+    protected void onDestroy() {
+        super.onDestroy();
+        SignalingClient.get().destroy();
+    }
 
+    @Override
+    public void onPeerJoined(String socketId) {
+        PeerConnection peerConnection = getOrCreatePeerConnection(socketId);
+        peerConnection.createOffer(new SdpAdapter("createOfferSdp" + socketId){
+            @Override
+            public void onCreateSuccess(SessionDescription sessionDescription) {
+                super.onCreateSuccess(sessionDescription);
+                //设置本地的
+                peerConnection.setLocalDescription(new SdpAdapter("setLocalSdp" + socketId), sessionDescription);
+                // 向加入房间的用户发送SDP
+                SignalingClient.get().sendSessionDescription(sessionDescription, socketId);
+            }
+        }, new MediaConstraints());
     }
 
     @Override
     public void onSelfJoined() {
-        peerConnection.createOffer(new SdpAdapter("local offer sdp"){
-            @Override
-            public void onCreateSuccess(SessionDescription sessionDescription) {
-                super.onCreateSuccess(sessionDescription);
-                peerConnection.setLocalDescription(new SdpAdapter("local set local"), sessionDescription);
-                SignalingClient.get().sendSessionDescription(sessionDescription);
-            }
-        }, new MediaConstraints());
+
     }
 
     @Override
@@ -201,14 +238,16 @@ public class MainActivity extends AppCompatActivity implements SignalingClient.C
     @Override
     public void onOfferReceived(JSONObject data) {
         runOnUiThread(() -> {
-            peerConnection.setRemoteDescription(new SdpAdapter("localSetRemote"),
+            String socketId = data.optString("from");
+            PeerConnection peerConnection = getOrCreatePeerConnection(socketId);
+            peerConnection.setRemoteDescription(new SdpAdapter("setRemoteSdp" + socketId),
                     new SessionDescription(SessionDescription.Type.OFFER, data.optString("sdp")));
             peerConnection.createAnswer(new SdpAdapter("localAnswerSdp") {
                 @Override
                 public void onCreateSuccess(SessionDescription sdp) {
                     super.onCreateSuccess(sdp);
-                    peerConnection.setLocalDescription(new SdpAdapter("localSetLocal"), sdp);
-                    SignalingClient.get().sendSessionDescription(sdp);
+                    peerConnection.setLocalDescription(new SdpAdapter("setLocalSdp"), sdp);
+                    SignalingClient.get().sendSessionDescription(sdp, socketId);
                 }
             }, new MediaConstraints());
         });
@@ -216,12 +255,16 @@ public class MainActivity extends AppCompatActivity implements SignalingClient.C
 
     @Override
     public void onAnswerReceived(JSONObject data) {
-        peerConnection.setRemoteDescription(new SdpAdapter("localSetRemote"),
+        String socketId = data.optString("from");
+        PeerConnection peerConnection = getOrCreatePeerConnection(socketId);
+        peerConnection.setRemoteDescription(new SdpAdapter("setRemoteSdp" + socketId),
                 new SessionDescription(SessionDescription.Type.ANSWER, data.optString("sdp")));
     }
 
     @Override
     public void onIceCandidateReceived(JSONObject data) {
+        String socketId = data.optString("from");
+        PeerConnection peerConnection = getOrCreatePeerConnection(socketId);
         peerConnection.addIceCandidate(new IceCandidate(
                 data.optString("id"),
                 data.optInt("label"),

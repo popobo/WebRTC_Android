@@ -24,9 +24,7 @@ import io.socket.client.Socket;
 // 单例模式
 public class SignalingClient {
     private static SignalingClient instance;
-    private SignalingClient(){
-        init();
-    }
+    private SignalingClient(){}
 
     public static SignalingClient get(){
         if (null == instance){
@@ -69,7 +67,8 @@ public class SignalingClient {
         this.callback = callback;
     }
 
-    private void init(){
+    public void init(Callback callback){
+        this.callback = callback;
         try {
             SSLContext sslContext = SSLContext.getInstance("TLS");
             sslContext.init(null, trustAll, null);
@@ -93,7 +92,8 @@ public class SignalingClient {
             // 另一位用户加入房间
             socket.on("join", args -> {
                 Log.e("bo", "peer joined" + Arrays.toString(args));
-                callback.onPeerJoined(String.valueOf(args[0]));
+                //onPeerJoined(String socketId) 新加入用户的socketId
+                callback.onPeerJoined(String.valueOf(args[1]));
             });
 
             // 自己加入房间
@@ -146,14 +146,16 @@ public class SignalingClient {
         instance = null;
     }
 
-    // 发生ice候选
-    public void sendIceCandidate(IceCandidate iceCandidate) {
+    // 向指定目标to发送ice候选
+    public void sendIceCandidate(IceCandidate iceCandidate, String to) {
         JSONObject jo = new JSONObject();
         try {
             jo.put("type", "candidate");
             jo.put("label", iceCandidate.sdpMLineIndex);
             jo.put("id", iceCandidate.sdpMid);
             jo.put("candidate", iceCandidate.sdp);
+            jo.put("from", socket.id());
+            jo.put("to", to);
 
             socket.emit("message", jo);
         } catch (JSONException e) {
@@ -162,11 +164,13 @@ public class SignalingClient {
     }
 
     // 发生sdp
-    public void sendSessionDescription(SessionDescription sdp) {
+    public void sendSessionDescription(SessionDescription sdp, String to) {
         JSONObject jo = new JSONObject();
         try {
             jo.put("type", sdp.type.canonicalForm());
             jo.put("sdp", sdp.description);
+            jo.put("from", socket.id());
+            jo.put("to", to);
 
             socket.emit("message", jo);
         } catch (JSONException e) {
